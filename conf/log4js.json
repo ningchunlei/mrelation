@@ -1,0 +1,15 @@
+{
+    "appenders": [
+        { "type": "console" },
+        {
+            "category": "mrelation",
+            "type": "dateFile",
+            "filename": "log/mrelation.log",
+            "pattern": "yyyy-MM-dd"
+        }
+    ],
+
+    "levels": {
+        "mrelation":  "info"
+    }
+}
