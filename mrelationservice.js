@@ -4,6 +4,7 @@ var RelationService = require("./thrift/MRelationIFace")
 var ShareStruct_ttypes = require("./thrift/ShareStruct_Types")
 var ErrorNo_ttypes = require("./thrift/ErrorNo_Types")
 var Exception_ttypes = require("./thrift/Exception_Types")
+var IKaoDBService = require("./thrift/IKaoDBIFace")
 var redis = require("redis")
 
 var poolModule = require('generic-pool');
@@ -20,28 +21,51 @@ var pool = poolModule.Pool({
     log : true
 });
 
+var ikaodbPool = poolModule.Pool({
+    name : "ikaodb",
+    create   : function(callback) {
+        var dbconnection = thrift.createConnection(process.conf.db.ip, process.conf.db.port)
+        var client = thrift.createClient(IKaoDBService, dbconnection);
+        callback(null, client);
+    },
+    destroy  : function(client) { client.quit(); }, //当超时则释放连接
+    max      : 10,   //最大连接数
+    idleTimeoutMillis : 10,  //超时时间
+    log : true
+})
+
 var FALSE = -1
 var TRUE = 1
 
 var ANSWER = "Answer"
+var RIGHT = "Right"
 
 var server = exports.relation = thrift.createServer(RelationService,{
 
     getMsgCounter: function(mids,response){
         var ret = []
+        var icount = 0
         process.log.info(util.format("getMsgCounter:mids=%s",mids))
         pool.borrow(function(err,client){
             mids.forEach(function(ele){
-                 client.hget(ele,ANSWER,function(err,reply){
-                     if(err!=null){
-                         ret[ele.toString]=-1
-                     }else{
+                 client.hgetall(ele,function(err,reply){
+                     icount++;
+                     if(reply!=null && reply.length>0){
                          ret[ele.toString]=reply;
                      }
-                     if(ret.length==mids.length){
+                     if(icount==mids.length){
                         pool.release(client)
+                        if(ret.length!=mids.length){
+                            ikaodbPool.borrow(function(err,idb){
+                                idb.getMsgCounter(mids,function(err,reply){
+                                    ikaodbPool.release(idb)
+                                    response(reply);
+                                })
+                            })
+                            return;
+                        }
                         response(ret);
-                         ret = null;
+                        ret = null;
                      }
                  })
             })
@@ -53,7 +77,16 @@ var server = exports.relation = thrift.createServer(RelationService,{
         pool.borrow(function(err,client){
             client.zrevrange(ANSWER+"_"+mid,start-1,start+len-1,function(err,reply){
                  pool.release(client)
-                 response(reply)
+                 if(reply!=null && reply.length==0){
+                     ikaodbPool.borrow(function(err,idb){
+                           idb.getRelatedMsg(mid,start,len,function(err,reply){
+                               ikaodbPool.release(idb)
+                               response(reply)
+                           })
+                     })
+                 }else{
+                    response(reply)
+                 }
             })
         })
     },
@@ -61,7 +94,7 @@ var server = exports.relation = thrift.createServer(RelationService,{
     initMsg:function(mid,response){
         process.log.info(util.format("initMsg:mid=%s",mid))
         pool.borrow(function(err,client){
-            client.hset(mid,ANSWER,"0",function(err,reply){
+            client.hmset(mid,ShareStruct_ttypes.MsgCounter.answer,0,ShareStruct_ttypes.MsgCounter.right,0,function(err,reply){
                 client.zadd(ANSWER+"_"+mid,0,"-1",function(err,reply){
                     pool.release(client);
                     if(err!=null)
@@ -73,52 +106,78 @@ var server = exports.relation = thrift.createServer(RelationService,{
         })
     } ,
 
-    incr:function(mid,response){
-        process.log.info(util.format("incrMsg:mid=%s",mid))
+    incr:function(mid,type,response){
+        process.log.info(util.format("incrMsg:mid=%s,type=%d",mid,type))
         pool.borrow(function(err,client){
-            client.hincrby(mid,ANSWER,1,function(err,reply){
-                pool.release(client)
-                if(err!=null)
-                    response(FALSE)
-                else
+            client.exists(mid,function(err,reply){
+                ikaodbPool.borrow(function(err,idb){
+                    idb.incrForMsg(mid,type,function(){ikaodbPool.release(idb)})
+                })
+                if(reply==1){
+                    client.hincrby(mid,type,1,function(err,reply){
+                        pool.release(client)
+                        if(err!=null)
+                            response(FALSE)
+                        else
+                            response(TRUE)
+                    });
+                }else{
+                    pool.release(client)
                     response(TRUE)
-            });
+                }
+            })
         })
     },
 
-    decr:function(mid,response){
-        process.log.info(util.format("decrMsg:mid=%s",mid))
+    decr:function(mid,type,response){
+        process.log.info(util.format("decrMsg:mid=%s,type=%d",mid,type))
         pool.borrow(function(err,client){
-            client.hincrby(mid,ANSWER,1,function(err,reply){
-                pool.release(client)
-                if(err!=null)
-                    response(FALSE)
-                else
+            client.exists(mid,function(err,reply){
+                ikaodbPool.borrow(function(err,idb){
+                    idb.decrForMsg(mid,type,function(){ikaodbPool.release(idb)})
+                })
+                if(reply==1){
+                    client.hincrby(mid,type,-1,function(err,reply){
+                        pool.release(client)
+                        if(err!=null)
+                            response(FALSE)
+                        else
+                            response(TRUE)
+                    });
+                }else{
+                    pool.release(client)
                     response(TRUE)
-            });
+                }
+            })
         })
     },
 
     addRelatedMsg:function(mid,answer,response){
         process.log.info(util.format("addRelatedMsg:mid=%s",mid))
         pool.borrow(function(err,client){
-            client.zadd(ANSWER+"-"+mid,0,answer,function(err,reply){
-                client.zremrangebyrank(ANSWER+"_"+msg.getRelatedmid(),process.conf.server.topN,-1,function(err,reply){
-                    pool.release(client)
-                    if(err!=null){
-                        response(FALSE)
-                        return;
-                    }
-                    incr(mid,function(reply){
-                        response(reply)
+            client.exists(ANSWER+"-"+mid,function(err,reply){
+                ikaodbPool.borrow(function(err,idb){
+                    idb.addRelatedMsg(mid,answer,function(){ikaodbPool.release(idb)})
+                })
+                if(reply==1){
+                    client.zadd(ANSWER+"-"+mid,new Date().getTime(),answer,function(err,reply){
+                        pool.release(client);
+                        incr(mid,ShareStruct_ttypes.MsgCounter.answer,function(){response(TRUE)})
                     });
-                });
-            });
+                }else{
+                    pool.release(client);
+                    incr(mid,ShareStruct_ttypes.MsgCounter.answer,function(){response(TRUE)})
+                }
+            })
+
         })
     },
 
     deleteRelatedMsg:function(mid,answer,response){
         process.log.info(util.format("deleteRelatedMsg:mid=%s",mid))
+        ikaodbPool.borrow(function(err,idb){
+            idb.deleteRelatedMsg(mid,answer,function(){ikaodbPool.release(idb)})
+        })
         pool.borrow(function(err,client){
             client.zrem(ANSWER+"-"+mid,answer,function(err,reply){
                 pool.release(client)
@@ -126,7 +185,7 @@ var server = exports.relation = thrift.createServer(RelationService,{
                     response(FALSE)
                     return
                 }
-                decr(mid,function(reply){
+                decr(mid,ShareStruct_ttypes.MsgCounter.answer,function(reply){
                     response(reply)
                 });
             });
